@@ -30,6 +30,8 @@ export interface RequestScope {
   readonly token: string | null;
   /** The env's own token — the only credential the suite presents. */
   readonly validToken: string;
+  /** The store every surface shares. */
+  readonly forge: Forge;
 }
 
 /** The token the suite presents, from the environment; a local default keeps dev runs answerable. */
@@ -60,6 +62,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     query,
     token: bearerToken(req),
     validToken: VALID_TOKEN,
+    forge,
   };
 
   // The env's boot check calls this twice: 200 {"ok":true}.
