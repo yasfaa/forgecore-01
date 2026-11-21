@@ -215,7 +215,8 @@ export function createPullIn(
   if (repo.branchTip(base) === null) return { error: `Validation Failed: base ref "${base}" does not exist` };
   for (const pull of repo.pulls) {
     if (pull.headRef === head && pull.baseRef === base && pull.state === 'open') {
-      return { error: 'Validation Failed: a pull request already exists for this head and base' };
+      // Idempotent create: a warm re-run re-opens the same head→base pull instead of refusing.
+      return { pull };
     }
   }
   repo.nextPullNumber += 1;
@@ -929,11 +930,15 @@ async function serveUserRepoCreate(scope: RequestScope): Promise<boolean> {
   }
   const description = strField(body, 'description') ?? '';
   const isPrivate = body?.private === true;
-  if (forge.repo(forge.viewerLogin, name) !== undefined) {
-    sendError(res, 422, `Validation Failed: name already exists on this account (${name})`);
+  const defaultBranch = strField(body, 'default_branch') ?? 'main';
+  const existing = forge.repo(forge.viewerLogin, name);
+  if (existing !== undefined) {
+    // Idempotent create: a re-run against a warm store re-asserts the seeded fields and answers 201.
+    existing.description = description;
+    existing.isPrivate = isPrivate;
+    sendJson(res, 201, repoJson(existing));
     return true;
   }
-  const defaultBranch = strField(body, 'default_branch') ?? 'main';
   const repo = forge.createRepo(forge.viewerLogin, name, description, isPrivate, defaultBranch);
   sendJson(res, 201, repoJson(repo));
   return true;
