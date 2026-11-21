@@ -210,68 +210,61 @@ function identityLine(id: Identity): string {
 
 /**
  * Apply file changes on top of a base tree and return the new root tree sha. A change names a path
- * with either a blob sha to set or null to remove; nested paths build the intermediate trees.
+ * with either a blob sha to set or null to remove; the tree is rebuilt from the flat file list,
+ * bottom-up, so directories never carry stale or phantom entries.
  */
 export function applyTreeChanges(
   repo: ForgeRepo,
   baseTreeSha: string | null,
   changes: readonly { path: string; blobSha: string | null; mode?: string }[],
 ): string {
-  const rootEntries: { [name: string]: { sha: string; mode: string; isTree: boolean } } = {};
-  const loadInto = (treeSha: string | null, prefix: string): void => {
-    if (treeSha === null) return;
+  // Every file of the base tree, keyed by its full path.
+  const files = new Map<string, { sha: string; mode: string }>();
+  const collect = (treeSha: string, prefix: string): void => {
     const tree = repo.readObject(treeSha);
     if (tree === undefined) return;
     for (const entry of parseTree(tree.data)) {
-      const full = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
-      const isTree = entry.mode === '40000' || entry.mode === '040000';
-      if (isTree) {
-        const sub = rootEntries[full] ?? { sha: entry.sha, mode: '40000', isTree: true };
-        sub.isTree = true;
-        rootEntries[full] = sub;
-        loadInto(entry.sha, full);
-      } else {
-        rootEntries[full] = { sha: entry.sha, mode: entry.mode, isTree: false };
-      }
+      const path = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
+      if (entry.mode === '40000' || entry.mode === '040000') collect(entry.sha, path);
+      else files.set(path, { sha: entry.sha, mode: entry.mode });
     }
   };
-  loadInto(baseTreeSha, '');
+  if (baseTreeSha !== null) collect(baseTreeSha, '');
   for (const change of changes) {
-    if (change.blobSha === null) delete rootEntries[change.path];
-    else rootEntries[change.path] = { sha: change.blobSha, mode: change.mode ?? '100644', isTree: false };
+    if (change.blobSha === null) files.delete(change.path);
+    else files.set(change.path, { sha: change.blobSha, mode: change.mode ?? '100644' });
   }
-  const paths = Object.keys(rootEntries).sort();
+  // Build bottom-up: the deepest directories first, one tree object each.
   const cache = new Map<string, string>();
-  const buildFor = (prefix: string): string => {
+  const childrenOf = new Map<string, string[]>();
+  const dirs = new Set<string>();
+  for (const path of files.keys()) {
+    const parts = path.split('/');
+    for (let i = 1; i < parts.length; i += 1) {
+      const dir = parts.slice(0, i).join('/');
+      const parent = i === 1 ? '' : parts.slice(0, i - 1).join('/');
+      const list = childrenOf.get(parent) ?? [];
+      if (!list.includes(dir)) list.push(dir);
+      childrenOf.set(parent, list);
+      dirs.add(dir);
+    }
+  }
+  const buildDir = (prefix: string): string => {
     const cached = cache.get(prefix);
     if (cached !== undefined) return cached;
-    const own = paths.filter((path) => {
-      const under = prefix === '' ? !path.includes('/') : path.startsWith(`${prefix}/`);
-      if (!under) return false;
-      const rest = prefix === '' ? path : path.slice(prefix.length + 1);
-      return !rest.includes('/');
-    });
-    const entries: TreeEntry[] = own.map((path) => {
-      const file = rootEntries[path]!;
-      return { mode: file.isTree ? '40000' : file.mode, name: path.slice(prefix === '' ? 0 : prefix.length + 1), sha: file.sha };
-    });
-    const rest = new Set<string>();
-    for (const path of paths) {
-      if (prefix === '' ? path.includes('/') : path.startsWith(`${prefix}/`)) {
-        const child = prefix === '' ? path.split('/')[0]! : path.slice(prefix.length + 1).split('/')[0]!;
-        if (!own.some((entry) => entry.name === child)) rest.add(child);
-      }
+    const entries: TreeEntry[] = [];
+    for (const dir of (childrenOf.get(prefix) ?? []).sort()) entries.push({ mode: '40000', name: dir.slice(prefix === '' ? 0 : prefix.length + 1), sha: buildDir(dir) });
+    for (const [path, file] of files) {
+      const parent = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
+      if (parent !== prefix) continue;
+      entries.push({ mode: file.mode, name: path.slice(parent === '' ? 0 : parent.length + 1), sha: file.sha });
     }
-    const childEntries: TreeEntry[] = [...rest].sort().map((child) => ({
-      mode: '40000',
-      name: child,
-      sha: buildFor(prefix === '' ? child : `${prefix}/${child}`),
-    }));
-    const sha = repo.writeObject('tree', buildTree([...childEntries, ...entries]));
+    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    const sha = repo.writeObject('tree', buildTree(entries));
     cache.set(prefix, sha);
     return sha;
   };
-  return buildFor('');
+  return buildDir('');
 }
 
 /** Walk one commit's whole tree and collect every blob path. */
