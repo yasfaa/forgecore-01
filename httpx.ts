@@ -14,6 +14,17 @@ export function nextRequestId(): string {
   return `req-${requestCounter.toString(16).padStart(8, '0')}`;
 }
 
+/** Write a fully built response body with the standard JSON reply headers. */
+export function sendBuffer(res: ServerResponse, status: number, body: Buffer, headers: Record<string, string> = {}): void {
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'content-length': body.length,
+    'x-github-request-id': nextRequestId(),
+    ...headers,
+  });
+  res.end(body);
+}
+
 /** Answer with a JSON body. Extra headers ride along; the request id is always set. */
 export function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
   const text = `${JSON.stringify(body)}\n`;
@@ -52,7 +63,7 @@ export function readBody(req: IncomingMessage, capBytes = 64 * 1024 * 1024): Pro
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => resolve(chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
@@ -78,10 +89,22 @@ export function bearerToken(req: IncomingMessage): string | null {
 }
 
 /** The URL's pathname and query of one request. */
+const PLAIN_PATH = /^\/[A-Za-z0-9._~!$&'()*+,;=:@\-]+$/;
+const EMPTY_QUERY = new URLSearchParams();
+
 export function splitUrl(req: IncomingMessage): { path: string; query: URLSearchParams } {
+  const url = req.url ?? '/';
+  // Fast path: a plain ASCII path with no query, fragment, dot-segments or escapes is already its
+  // own pathname, and the URL constructor would return exactly these bytes.
+  if (
+    url.length > 1 && url.charCodeAt(0) === 47 && url.charCodeAt(1) !== 47 &&
+    PLAIN_PATH.test(url) && url.indexOf('/.') < 0
+  ) {
+    return { path: url, query: EMPTY_QUERY };
+  }
   try {
-    const url = new URL(req.url ?? '/', 'http://forge');
-    return { path: url.pathname, query: url.searchParams };
+    const url2 = new URL(url, 'http://forge');
+    return { path: url2.pathname, query: url2.searchParams };
   } catch {
     return { path: '/', query: new URLSearchParams() };
   }

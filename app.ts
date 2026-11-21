@@ -43,12 +43,18 @@ export function isAuthorized(scope: RequestScope): boolean {
 }
 
 export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     void route(req, res).catch((err: unknown) => {
       if (!res.headersSent) sendError(res, 500, err instanceof Error ? err.message : String(err));
       else res.destroy();
     });
   });
+  // Git's pkt-line framing has no read-ahead worth batching: every byte the client sends is a
+  // request boundary, so Nagle off keeps pushes and clones from stalling on coalesced writes.
+  server.on('connection', (socket) => {
+    socket.setNoDelay(true);
+  });
+  return server;
 }
 
 async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -72,10 +78,14 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   }
 
   try {
-    // Git smart HTTP serves on its path without the bearer discipline git itself does not use.
-    if (await tryServeSmartHttp(scope)) return;
-    // Everything below is the token's world.
-    if (await tryServeRest(scope)) return;
+    if (path.startsWith('/api/v3')) {
+      // Everything below is the token's world, and the git services cannot own these paths.
+      if (await tryServeRest(scope)) return;
+    } else {
+      // Git smart HTTP serves on its path without the bearer discipline git itself does not use.
+      if (await tryServeSmartHttp(scope)) return;
+      if (await tryServeRest(scope)) return;
+    }
     if (await tryServeGraphql(scope)) return;
     if (await tryServeMcp(scope)) return;
     sendError(res, 404, 'Not Found');

@@ -32,6 +32,45 @@ function respond(res: import('node:http').ServerResponse, status: number, conten
   res.end(body);
 }
 
+// ---------------------------------------------------------------------------------------------
+// memoized git responses
+//
+// Every entry below is keyed by bytes that only depend on store content — ref tips, the default
+// branch and the fetch request's own arguments — so two runs of the same request sequence build
+// the same entries and serve byte-identical responses. Objects in the store are immutable and
+// refs only move, so a response memoized under one ref stamp stays correct until the stamp (which
+// is part of the key) changes.
+// ---------------------------------------------------------------------------------------------
+
+/** One stamp of a repository's ref state: the default branch and every ref tip. */
+function refsStamp(repo: ForgeRepo): string {
+  let stamp = repo.defaultBranch;
+  const refs = [...repo.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  for (const [name, sha] of refs) stamp += `|${name} ${sha}`;
+  return stamp;
+}
+
+const MEMO_CAP = 128;
+
+/** A memo keyed by (repo, stamp, request); old entries drop off once the map outgrows its cap. */
+function memoGet<T>(map: Map<string, T>, key: string): T | undefined {
+  const hit = map.get(key);
+  if (hit !== undefined) {
+    // Refresh insertion order so a hot entry is never the one evicted.
+    map.delete(key);
+    map.set(key, hit);
+  }
+  return hit;
+}
+
+function memoPut<T>(map: Map<string, T>, key: string, value: T): void {
+  map.set(key, value);
+  if (map.size > MEMO_CAP) {
+    const oldest = map.keys().next().value;
+    if (typeof oldest === 'string') map.delete(oldest);
+  }
+}
+
 /** True when the client asked for protocol v2 with the Git-Protocol header. */
 function wantsProtocolV2(headerValue: string | string[] | undefined): boolean {
   if (typeof headerValue !== 'string') return false;
@@ -104,8 +143,15 @@ function refLines(repo: ForgeRepo, caps: string): Buffer[] {
 }
 
 function serveInfoRefsUpload(scope: import('./app.ts').RequestScope, repo: ForgeRepo): void {
+  const v2 = wantsProtocolV2(scope.req.headers['git-protocol']);
+  const memoKey = `u${v2 ? '2' : '0'}|${refsStamp(repo)}`;
+  const cached = memoGet(uploadAdvertMemo, memoKey);
+  if (cached !== undefined) {
+    respond(scope.res, 200, UPLOAD_ADVERTISEMENT, cached);
+    return;
+  }
   let body: Buffer;
-  if (wantsProtocolV2(scope.req.headers['git-protocol'])) {
+  if (v2) {
     body = Buffer.concat([
       pktData('version 2\n'),
       pktData(`${AGENT}\n`),
@@ -119,10 +165,19 @@ function serveInfoRefsUpload(scope: import('./app.ts').RequestScope, repo: Forge
     const caps = `${V0_UPLOAD_CAPS} symref=HEAD:refs/heads/${repo.defaultBranch} ${AGENT}`;
     body = Buffer.concat([pktData('# service=git-upload-pack\n'), flushPkt(), ...refLines(repo, caps), flushPkt()]);
   }
+  memoPut(uploadAdvertMemo, memoKey, body);
   respond(scope.res, 200, UPLOAD_ADVERTISEMENT, body);
 }
 
+const uploadAdvertMemo = new Map<string, Buffer>();
+
 function serveInfoRefsReceive(scope: import('./app.ts').RequestScope, repo: ForgeRepo): void {
+  const memoKey = refsStamp(repo);
+  const cached = memoGet(receiveAdvertMemo, memoKey);
+  if (cached !== undefined) {
+    respond(scope.res, 200, RECEIVE_ADVERTISEMENT, cached);
+    return;
+  }
   const caps = `${V0_RECEIVE_CAPS} ${AGENT}`;
   const body = Buffer.concat([
     pktData('# service=git-receive-pack\n'),
@@ -130,8 +185,11 @@ function serveInfoRefsReceive(scope: import('./app.ts').RequestScope, repo: Forg
     ...refLines(repo, caps),
     flushPkt(),
   ]);
+  memoPut(receiveAdvertMemo, memoKey, body);
   respond(scope.res, 200, RECEIVE_ADVERTISEMENT, body);
 }
+
+const receiveAdvertMemo = new Map<string, Buffer>();
 
 // ---------------------------------------------------------------------------------------------
 // upload-pack
@@ -203,6 +261,13 @@ function serveLsRefs(scope: import('./app.ts').RequestScope, repo: ForgeRepo, ar
     else if (arg.startsWith('ref-prefix ')) prefixes.push(arg.slice('ref-prefix '.length));
   }
   const keep = (name: string): boolean => prefixes.length === 0 || prefixes.some((prefix) => name.startsWith(prefix));
+  const stamp = refsStamp(repo);
+  const memoKey = `ls|${stamp}|${peel ? 'p' : ''}${symrefs ? 's' : ''}${unborn ? 'u' : ''}|${prefixes.join('\u0001')}`;
+  const cached = memoGet(lsRefsMemo, memoKey);
+  if (cached !== undefined) {
+    respond(scope.res, 200, UPLOAD_RESULT, cached);
+    return;
+  }
   const out: Buffer[] = [];
   const headSha = repo.headSha();
   const headTarget = `refs/heads/${repo.defaultBranch}`;
@@ -223,8 +288,12 @@ function serveLsRefs(scope: import('./app.ts').RequestScope, repo: ForgeRepo, ar
     out.push(pktData(`${line}\n`));
   }
   out.push(flushPkt());
-  respond(scope.res, 200, UPLOAD_RESULT, Buffer.concat(out));
+  const body = Buffer.concat(out);
+  memoPut(lsRefsMemo, memoKey, body);
+  respond(scope.res, 200, UPLOAD_RESULT, body);
 }
+
+const lsRefsMemo = new Map<string, Buffer>();
 
 // ---------------------------------------------------------------------------------------------
 // fetch object selection
@@ -403,6 +472,14 @@ function serveFetch(scope: import('./app.ts').RequestScope, repo: ForgeRepo, arg
     respond(scope.res, 200, UPLOAD_RESULT, acks);
     return;
   }
+  // The reply is a pure function of the request's wants/haves/depth arguments and the immutable
+  // objects those name, so it memoizes under the request arguments plus the repo's ref stamp.
+  const memoKey = `f2|${refsStamp(repo)}|w${wants.join(',')}|h${haves.join(',')}|d${depth}|si${since}|sh${shallowIn.join(',')}|dn${deepenNot.join(',')}`;
+  const cached = memoGet(fetchMemo, memoKey);
+  if (cached !== undefined) {
+    respond(scope.res, 200, UPLOAD_RESULT, cached);
+    return;
+  }
   const selection = selectFetchObjects(repo, wants, haves, shallowIn, depth, since, deepenNot);
   const pack = buildPack(selection.objects);
   const parts: Buffer[] = [acks];
@@ -413,8 +490,12 @@ function serveFetch(scope: import('./app.ts').RequestScope, repo: ForgeRepo, arg
     parts.push(flushPkt());
   }
   parts.push(pktData('packfile\n'), ...sidebandFrames(pack, 1), flushPkt());
-  respond(scope.res, 200, UPLOAD_RESULT, Buffer.concat(parts));
+  const body = Buffer.concat(parts);
+  memoPut(fetchMemo, memoKey, body);
+  respond(scope.res, 200, UPLOAD_RESULT, body);
 }
+
+const fetchMemo = new Map<string, Buffer>();
 
 // ---------------------------------------------------------------------------------------------
 // upload-pack v0 fallback
@@ -465,13 +546,21 @@ function serveUploadPackV0(scope: import('./app.ts').RequestScope, repo: ForgeRe
     return;
   }
   const sideband = caps.split(' ').includes('side-band-64k');
+  const memoKey = `f0|${refsStamp(repo)}|${sideband ? 'sb' : 'raw'}|w${wants.join(',')}|h${firstPass.haves.join(',')}|d${depth}|sh${shallowIn.join(',')}`;
+  const cached = memoGet(fetchMemo, memoKey);
+  if (cached !== undefined) {
+    respond(scope.res, 200, UPLOAD_RESULT, cached);
+    return;
+  }
   const selection = selectFetchObjects(repo, wants, firstPass.haves, shallowIn, depth, null, []);
   const pack = buildPack(selection.objects);
   const parts: Buffer[] = [pktData('NAK\n')];
   for (const sha of selection.shallow) parts.push(pktData(`shallow ${sha}\n`));
   if (sideband) parts.push(...sidebandFrames(pack, 1));
   else parts.push(flushPkt(), pack);
-  respond(scope.res, 200, UPLOAD_RESULT, Buffer.concat(parts));
+  const body = Buffer.concat(parts);
+  memoPut(fetchMemo, memoKey, body);
+  respond(scope.res, 200, UPLOAD_RESULT, body);
 }
 
 // ---------------------------------------------------------------------------------------------

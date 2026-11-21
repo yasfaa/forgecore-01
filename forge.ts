@@ -96,8 +96,10 @@ export class ForgeRepo {
     this.defaultBranch = defaultBranch;
   }
 
+  private fullNameMemo: string | undefined;
+
   fullName(): string {
-    return `${this.owner}/${this.name}`;
+    return (this.fullNameMemo ??= `${this.owner}/${this.name}`);
   }
 
   /** The tip sha of a branch given bare ('main') or full ('refs/heads/main'). */

@@ -8,7 +8,7 @@
 // functions of the store, so MCP and GraphQL hand out the same objects this file serves.
 
 import type { RequestScope } from './app.ts';
-import { parseJsonBody, readBody, sendError, sendJson, sendNoContent } from './httpx.ts';
+import { parseJsonBody, readBody, sendBuffer, sendError, sendJson, sendNoContent } from './httpx.ts';
 import { USERS, VIEWER_LOGIN, type ForgeUser } from './scenario.ts';
 import {
   parseCommit,
@@ -28,6 +28,16 @@ const ZERO_SHA = '0'.repeat(40);
 type Json = Record<string, unknown>;
 
 // ---------------------------------------------------------------- shared object renderers
+
+// The two constant documents, serialized once: their bytes never depend on the store.
+const ROOT_BODY = Buffer.from(`${JSON.stringify({
+  current_user_url: '/api/v3/user',
+  user_repositories_url: '/api/v3/user/repos{?per_page,page}',
+  repository_url: '/api/v3/repos/{owner}/{repo}',
+  issue_url: '/api/v3/repos/{owner}/{repo}/issues/{number}',
+  meta_url: '/api/v3/meta',
+})}\n`, 'utf8');
+const META_BODY = Buffer.from(`${JSON.stringify({ installed_version: '1.0.0' })}\n`, 'utf8');
 
 const repoIds = new Map<string, number>();
 
@@ -118,6 +128,30 @@ export function issueJson(repo: ForgeRepo, issue: Issue): Json {
     repository_url: `https://forge.local/${repo.fullName()}`,
     events_url: `https://forge.local/${repo.fullName()}/issues/${issue.number}/events`,
   };
+}
+
+// GET /issues/<n> is the hot read path: the rendered bytes are memoized per issue and revalidated
+// against a signature of exactly the fields issueJson reads, so a cache hit is byte-identical to a
+// fresh render and any mutation of the issue (state, title, body, comments, labels) misses.
+const issueBodies = new WeakMap<ForgeRepo, Map<number, { sig: string; body: Buffer }>>();
+
+function issueSig(issue: Issue): string {
+  return `${issue.state}|${issue.title}|${issue.body ?? ''}|${issue.comments.length}|${issue.labels.length}`;
+}
+
+/** The GET /issues/<n> response bytes for an issue's current state, memoized by content. */
+export function issueResponse(repo: ForgeRepo, issue: Issue): Buffer {
+  const sig = issueSig(issue);
+  let cache = issueBodies.get(repo);
+  if (cache === undefined) {
+    cache = new Map();
+    issueBodies.set(repo, cache);
+  }
+  const hit = cache.get(issue.number);
+  if (hit !== undefined && hit.sig === sig) return hit.body;
+  const body = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
+  cache.set(issue.number, { sig, body });
+  return body;
 }
 
 function refShaOf(repo: ForgeRepo, branch: string): string {
@@ -346,6 +380,11 @@ function intParam(params: URLSearchParams, key: string, fallback: number, min: n
 }
 
 function decodeSegment(segment: string): string {
+  // decodeURIComponent is the identity on every escape-free segment, and the hot paths carry none.
+  return segment.includes('%') ? tryDecode(segment) : segment;
+}
+
+function tryDecode(segment: string): string {
   try {
     return decodeURIComponent(segment);
   } catch {
@@ -598,18 +637,12 @@ export async function tryServeRest(scope: RequestScope): Promise<boolean> {
   }
 
   if (method === 'GET' && rest === '/') {
-    sendJson(res, 200, {
-      current_user_url: '/api/v3/user',
-      user_repositories_url: '/api/v3/user/repos{?per_page,page}',
-      repository_url: '/api/v3/repos/{owner}/{repo}',
-      issue_url: '/api/v3/repos/{owner}/{repo}/issues/{number}',
-      meta_url: '/api/v3/meta',
-    }, { 'x-oauth-scopes': 'repo, read:org', 'x-accepted-oauth-scopes': 'repo' });
+    sendBuffer(res, 200, ROOT_BODY, { 'x-oauth-scopes': 'repo, read:org', 'x-accepted-oauth-scopes': 'repo' });
     return true;
   }
 
   if (method === 'GET' && rest === '/meta') {
-    sendJson(res, 200, { installed_version: '1.0.0' });
+    sendBuffer(res, 200, META_BODY);
     return true;
   }
 
@@ -813,7 +846,7 @@ export async function tryServeRest(scope: RequestScope): Promise<boolean> {
       return true;
     }
     if (method === 'GET') {
-      sendJson(res, 200, issueJson(repo, issue));
+      sendBuffer(res, 200, issueResponse(repo, issue));
       return true;
     }
     if (method === 'PATCH') {
@@ -824,7 +857,7 @@ export async function tryServeRest(scope: RequestScope): Promise<boolean> {
       if (title !== null) issue.title = title;
       const issueBody = strField(body, 'body');
       if (issueBody !== null) issue.body = issueBody;
-      sendJson(res, 200, issueJson(repo, issue));
+      sendBuffer(res, 200, issueResponse(repo, issue));
       return true;
     }
     sendError(res, 404, 'Not Found');
@@ -1184,7 +1217,7 @@ async function serveIssueCreate(scope: RequestScope, repo: ForgeRepo): Promise<b
     sendError(res, 422, result.error);
     return true;
   }
-  sendJson(res, 201, issueJson(repo, result.issue));
+  sendBuffer(res, 201, issueResponse(repo, result.issue));
   return true;
 }
 
