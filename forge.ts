@@ -357,19 +357,36 @@ export function squashMerge(repo: ForgeRepo, baseTip: string, headTip: string, m
   }));
 }
 
-/** The first common ancestor of two commits, walking parents breadth-first. */
+/** The best common ancestor of two commits: every ancestor of `a`, then breadth-first from `b` until one is met. */
 export function mergeBase(repo: ForgeRepo, a: string, b: string): string | null {
-  const seen = new Set<string>([a]);
+  if (a === b) return a;
+  const aAncestors = new Set<string>([a]);
   let frontier: string[] = [a];
   while (frontier.length > 0) {
-    if (frontier.includes(b)) return b;
     const next: string[] = [];
     for (const sha of frontier) {
       const commit = repo.readObject(sha);
       if (commit === undefined) continue;
       for (const parent of parseCommit(commit.data).parents) {
-        if (!seen.has(parent)) {
-          seen.add(parent);
+        if (!aAncestors.has(parent)) {
+          aAncestors.add(parent);
+          next.push(parent);
+        }
+      }
+    }
+    frontier = next;
+  }
+  const bSeen = new Set<string>([b]);
+  frontier = [b];
+  while (frontier.length > 0) {
+    const next: string[] = [];
+    for (const sha of frontier) {
+      if (aAncestors.has(sha)) return sha;
+      const commit = repo.readObject(sha);
+      if (commit === undefined) continue;
+      for (const parent of parseCommit(commit.data).parents) {
+        if (!bSeen.has(parent)) {
+          bSeen.add(parent);
           next.push(parent);
         }
       }
